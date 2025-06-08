@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Polylang Auto Translate All
  * Description: WP-CLI command to auto-translate posts and pages via Polylang Pro and DeepL REST API, reading settings from Polylang option and including ACF fields and taxonomies based on Polylang configuration.
- * Version: 1.4.0
+ * Version: 1.5.0
  * Author: Dmitry Tishakov
  */
 
@@ -58,8 +58,27 @@ class Polylang_Auto_Translate_All_Command {
                 continue;
             }
 
+            // Prepare translated terms map
+            $terms_map = [];
+            foreach ( $taxonomies as $tax ) {
+                $term_ids = wp_get_object_terms( $post->ID, $tax, [ 'fields' => 'ids' ] );
+                if ( empty( $term_ids ) ) {
+                    continue;
+                }
+                $translated_ids = [];
+                foreach ( $term_ids as $term_id ) {
+                    $term_trans = pll_get_term_translations( $term_id );
+                    if ( ! empty( $term_trans[ $target_lang ] ) ) {
+                        $translated_ids[] = $term_trans[ $target_lang ];
+                    }
+                }
+                if ( $translated_ids ) {
+                    $terms_map[ $tax ] = $translated_ids;
+                }
+            }
+
             // Build new post data
-            $new = [
+            $new_post = [
                 'post_type'    => $post->post_type,
                 'post_status'  => $post->post_status,
                 'post_author'  => $post->post_author,
@@ -67,16 +86,26 @@ class Polylang_Auto_Translate_All_Command {
                 'post_content' => $this->translate_text( $post->post_content, $source_lang, $target_lang ),
                 'post_excerpt' => $this->translate_text( $post->post_excerpt, $source_lang, $target_lang ),
             ];
-            $new_id = wp_insert_post( $new );
+
+            $new_id = wp_insert_post( $new_post );
             if ( is_wp_error( $new_id ) ) {
                 WP_CLI::warning( "Error inserting translation for #{$post->ID}: {$new_id->get_error_message()}" );
                 continue;
             }
 
-            // Copy featured image
-            $thumb = get_post_thumbnail_id( $post->ID );
-            if ( $thumb ) {
-                set_post_thumbnail( $new_id, $thumb );
+            // Assign taxonomy terms after insert
+            foreach ( $terms_map as $tax => $ids ) {
+                if ( 'category' === $tax ) {
+                    // For hierarchical categories
+                    wp_set_post_categories( $new_id, $ids, false );
+                } else {
+                    // Other taxonomies
+                    wp_set_object_terms( $new_id, $ids, $tax, false );
+                }
+            }
+// Copy featured image
+            if ( $thumb_id = get_post_thumbnail_id( $post->ID ) ) {
+                set_post_thumbnail( $new_id, $thumb_id );
             }
 
             // Copy or translate meta fields (including ACF)
@@ -93,28 +122,14 @@ class Polylang_Auto_Translate_All_Command {
                 }
             }
 
-            // Copy taxonomy terms
-            foreach ( $taxonomies as $tax ) {
-                $term_ids = wp_get_object_terms( $post->ID, $tax, [ 'fields' => 'ids' ] );
-                if ( ! empty( $term_ids ) ) {
-                    $new_terms = [];
-                    foreach ( $term_ids as $term_id ) {
-                        $term_trans = pll_get_term_translations( $term_id );
-                        if ( ! empty( $term_trans[ $target_lang ] ) ) {
-                            $new_terms[] = $term_trans[ $target_lang ];
-                        }
-                    }
-                    if ( ! empty( $new_terms ) ) {
-                        wp_set_object_terms( $new_id, $new_terms, $tax, false );
-                    }
-                }
-            }
-
             // Set language and save relationships
             pll_set_post_language( $new_id, $target_lang );
             $translations[ $source_lang ] = $post->ID;
             $translations[ $target_lang ] = $new_id;
             pll_save_post_translations( $translations );
+
+            // Force WP to refresh term relationships in list table
+            wp_update_post( [ 'ID' => $new_id ] );
 
             WP_CLI::success( "Translated #{$post->ID} → #{$new_id} ({$target_lang})." );
         }
@@ -124,7 +139,7 @@ class Polylang_Auto_Translate_All_Command {
      * Translate text via DeepL API based on Polylang settings, fallback to original on error or disabled
      */
     private function translate_text( $text, $source, $target ) {
-        if ( empty( trim( $text ) ) ) {
+        if ( ! trim( $text ) ) {
             return '';
         }
 
@@ -135,7 +150,7 @@ class Polylang_Auto_Translate_All_Command {
         $services  = $pll_opts['machine_translation_services'] ?? [];
         $deepl     = $services['deepl'] ?? [];
         $api_key   = $deepl['api_key'] ?? '';
-        $formality = ! empty( $deepl['formality'] ) && 'default' !== $deepl['formality'] ? $deepl['formality'] : '';
+        $formality = (! empty( $deepl['formality'] ) && 'default' !== $deepl['formality']) ? $deepl['formality'] : '';
         if ( ! $api_key ) {
             return $text;
         }
@@ -149,12 +164,12 @@ class Polylang_Auto_Translate_All_Command {
         if ( $formality ) {
             $body['formality'] = $formality;
         }
-
         $response = wp_remote_post( 'https://api.deepl.com/v2/translate', [ 'body' => $body ] );
         if ( is_wp_error( $response ) ) {
             WP_CLI::warning( "DeepL request failed: " . $response->get_error_message() );
             return $text;
         }
+
         $data = json_decode( wp_remote_retrieve_body( $response ), true );
         return $data['translations'][0]['text'] ?? $text;
     }
