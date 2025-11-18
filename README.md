@@ -596,7 +596,7 @@ wp polylang auto-translate-all --help
 
 - **Issues**: [GitHub Issues](https://github.com/yourusername/polylang-auto-translate-all/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/polylang-auto-translate-all/discussions)
-- **Email**: your.email@example.com
+- **Email**: mr.tishakov@gmail.com
 
 ---
 
