@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Polylang Auto Translate All
  * Description: WP-CLI command to auto-translate posts and pages via Polylang Pro and DeepL REST API, reading settings from Polylang option and including ACF fields and taxonomies based on Polylang configuration.
- * Version: 2.0.0
+ * Version: 2.0.1
  * Author: Dmitry Tishakov
  */
 
@@ -23,9 +23,9 @@ class Polylang_Auto_Translate_All_Command {
     private const MAX_RETRIES = 3;
     
     /**
-     * Posts per page for pagination
+     * Posts per page for pagination (reduced for memory efficiency)
      */
-    private const POSTS_PER_PAGE = 50;
+    private const POSTS_PER_PAGE = 10;
     
     /**
      * Log file path
@@ -77,6 +77,20 @@ class Polylang_Auto_Translate_All_Command {
      * @when after_wp_load
      */
     public function __invoke( $args, $assoc_args ) {
+        // Increase memory limit for translation operations
+        $current_limit = ini_get( 'memory_limit' );
+        if ( preg_match( '/^(\d+)(.)$/', $current_limit, $matches ) ) {
+            $current_mb = $matches[1];
+            if ( $matches[2] === 'G' ) {
+                $current_mb *= 1024;
+            }
+            // Increase to at least 512M
+            if ( $current_mb < 512 ) {
+                @ini_set( 'memory_limit', '512M' );
+                WP_CLI::log( 'Memory limit increased to 512M' );
+            }
+        }
+        
         $post_type   = $assoc_args['post_type'] ?? 'post';
         $target_lang = strtolower( $assoc_args['lang'] ?? 'de' );
         $dry_run     = isset( $assoc_args['dry-run'] );
@@ -201,6 +215,14 @@ class Polylang_Auto_Translate_All_Command {
                 
                 $processed_count++;
                 $progress->tick();
+                
+                // Aggressive memory cleanup after each post
+                if ( function_exists( 'gc_collect_cycles' ) ) {
+                    gc_collect_cycles();
+                }
+                
+                // Clear object cache to free memory
+                wp_cache_flush();
             }
             
             wp_reset_postdata();
@@ -236,6 +258,99 @@ class Polylang_Auto_Translate_All_Command {
     }
     
     /**
+     * Translate Gutenberg block content while preserving block structure
+     * Uses lightweight regex approach instead of parse_blocks() to save memory
+     */
+    private function translate_gutenberg_content( $content, $source_lang, $target_lang ) {
+        // If no Gutenberg blocks, translate as plain text
+        if ( strpos( $content, '<!-- wp:' ) === false ) {
+            return $this->translate_text( $content, $source_lang, $target_lang );
+        }
+        
+        // Extract all text content between HTML tags (skip block comments)
+        $pattern = '/>([^<]+)</';
+        preg_match_all( $pattern, $content, $matches );
+        
+        if ( empty( $matches[1] ) ) {
+            return $content;
+        }
+        
+        // Collect texts to translate
+        $texts_to_translate = [];
+        $replacements = [];
+        
+        foreach ( $matches[1] as $text ) {
+            $trimmed = trim( $text );
+            // Skip empty, whitespace-only, and non-translatable content
+            if ( empty( $trimmed ) || $this->should_skip_translation( $trimmed ) ) {
+                continue;
+            }
+            
+            // Store for batch translation
+            if ( ! in_array( $trimmed, $texts_to_translate, true ) ) {
+                $texts_to_translate[] = $trimmed;
+            }
+        }
+        
+        // If nothing to translate, return original
+        if ( empty( $texts_to_translate ) ) {
+            return $content;
+        }
+        
+        // Batch translate all texts
+        $translated_texts = $this->translate_texts_batch( 
+            $texts_to_translate, 
+            $source_lang, 
+            $target_lang 
+        );
+        
+        // Build replacement map with cleaned entities
+        foreach ( $texts_to_translate as $index => $original ) {
+            if ( isset( $translated_texts[ $index ] ) ) {
+                // Fix broken HTML entities (DeepL sometimes adds spaces)
+                $cleaned = $this->fix_html_entities( $translated_texts[ $index ] );
+                $replacements[ $original ] = $cleaned;
+            }
+        }
+        
+        // Replace in content (preserve HTML structure and block comments)
+        $translated_content = $content;
+        foreach ( $replacements as $original => $translated ) {
+            // Use preg_replace to replace text between tags only
+            $translated_content = preg_replace(
+                '/(>)(' . preg_quote( $original, '/' ) . ')(<)/',
+                '${1}' . str_replace( '$', '\\$', $translated ) . '${3}',
+                $translated_content
+            );
+        }
+        
+        return $translated_content;
+    }
+    
+    /**
+     * Fix broken HTML entities that DeepL sometimes creates
+     * e.g. "&nbsp ;" -> "&nbsp;" or "& nbsp;" -> "&nbsp;"
+     */
+    private function fix_html_entities( $text ) {
+        // Fix common broken entities with spaces
+        $fixes = [
+            '/&\s*nbsp\s*;/i'   => '&nbsp;',
+            '/&\s*amp\s*;/i'    => '&amp;',
+            '/&\s*quot\s*;/i'   => '&quot;',
+            '/&\s*lt\s*;/i'     => '&lt;',
+            '/&\s*gt\s*;/i'     => '&gt;',
+            '/&\s*apos\s*;/i'   => '&apos;',
+            '/&\s*#(\d+)\s*;/i' => '&#$1;',
+        ];
+        
+        foreach ( $fixes as $pattern => $replacement ) {
+            $text = preg_replace( $pattern, $replacement, $text );
+        }
+        
+        return $text;
+    }
+    
+    /**
      * Process single post translation
      */
     private function process_post( $post, $source_lang, $target_lang, $copy_metas, $taxonomies, $dry_run ) {
@@ -261,41 +376,23 @@ class Polylang_Auto_Translate_All_Command {
         }
         
         try {
-            // Prepare texts for batch translation
-            $texts_to_translate = [];
-            $text_keys = [];
+            // Translate post content (handles Gutenberg blocks properly)
+            $translated_title = '';
+            $translated_content = '';
+            $translated_excerpt = '';
             
             if ( ! empty( trim( $post->post_title ) ) ) {
-                $texts_to_translate[] = $post->post_title;
-                $text_keys[] = 'title';
+                $translated_title = $this->translate_text( $post->post_title, $source_lang, $target_lang );
+                $translated_title = $this->fix_html_entities( $translated_title );
             }
             
             if ( ! empty( trim( $post->post_content ) ) ) {
-                $texts_to_translate[] = $post->post_content;
-                $text_keys[] = 'content';
+                $translated_content = $this->translate_gutenberg_content( $post->post_content, $source_lang, $target_lang );
             }
             
             if ( ! empty( trim( $post->post_excerpt ) ) ) {
-                $texts_to_translate[] = $post->post_excerpt;
-                $text_keys[] = 'excerpt';
-            }
-            
-            // Batch translate main content
-            $translated_texts = $this->translate_texts_batch( 
-                $texts_to_translate, 
-                $source_lang, 
-                $target_lang 
-            );
-            
-            // Map translated texts back
-            $translated_data = [
-                'title'   => '',
-                'content' => '',
-                'excerpt' => '',
-            ];
-            
-            foreach ( $text_keys as $index => $key ) {
-                $translated_data[ $key ] = $translated_texts[ $index ] ?? '';
+                $translated_excerpt = $this->translate_text( $post->post_excerpt, $source_lang, $target_lang );
+                $translated_excerpt = $this->fix_html_entities( $translated_excerpt );
             }
             
             // Prepare translated terms map
@@ -324,9 +421,9 @@ class Polylang_Auto_Translate_All_Command {
                 'post_type'    => $post->post_type,
                 'post_status'  => $post->post_status,
                 'post_author'  => $post->post_author,
-                'post_title'   => $translated_data['title'] ?: $post->post_title,
-                'post_content' => $translated_data['content'] ?: $post->post_content,
-                'post_excerpt' => $translated_data['excerpt'] ?: $post->post_excerpt,
+                'post_title'   => $translated_title ?: $post->post_title,
+                'post_content' => $translated_content ?: $post->post_content,
+                'post_excerpt' => $translated_excerpt ?: $post->post_excerpt,
             ];
             
             $new_id = wp_insert_post( $new_post );
@@ -335,12 +432,26 @@ class Polylang_Auto_Translate_All_Command {
                 throw new Exception( $new_id->get_error_message() );
             }
             
-            // Assign taxonomy terms
+            // IMPORTANT: Set language BEFORE assigning taxonomies
+            // Polylang filters taxonomy queries by language
+            pll_set_post_language( $new_id, $target_lang );
+            
+            // Assign taxonomy terms AFTER setting language
             foreach ( $terms_map as $tax => $ids ) {
-                if ( 'category' === $tax ) {
-                    wp_set_post_categories( $new_id, $ids, false );
-                } else {
-                    wp_set_object_terms( $new_id, $ids, $tax, false );
+                if ( empty( $ids ) ) {
+                    continue;
+                }
+                
+                // Use wp_set_object_terms for all taxonomies (works for categories too)
+                $result = wp_set_object_terms( $new_id, $ids, $tax, false );
+                
+                if ( is_wp_error( $result ) ) {
+                    WP_CLI::warning( sprintf(
+                        'Failed to assign %s terms to post #%d: %s',
+                        $tax,
+                        $new_id,
+                        $result->get_error_message()
+                    ) );
                 }
             }
             
@@ -352,14 +463,13 @@ class Polylang_Auto_Translate_All_Command {
             // Copy or translate meta fields (including ACF)
             $this->process_post_meta( $post->ID, $new_id, $copy_metas, $source_lang, $target_lang );
             
-            // Set language and save relationships
-            pll_set_post_language( $new_id, $target_lang );
+            // Save translation relationships (language already set above)
             $translations[ $source_lang ] = $post->ID;
             $translations[ $target_lang ] = $new_id;
             pll_save_post_translations( $translations );
             
-            // Force WP to refresh term relationships
-            wp_update_post( [ 'ID' => $new_id ] );
+            // Force WP to refresh term relationships in admin
+            clean_post_cache( $new_id );
             
             $this->log( sprintf(
                 'Success: #%d "%s" -> #%d (%s)',
@@ -560,16 +670,32 @@ class Polylang_Auto_Translate_All_Command {
             return $texts;
         }
         
-        $body = [
-            'auth_key'    => $this->api_config['api_key'],
-            'text'        => $texts_to_send,
-            'source_lang' => strtoupper( $source ),
-            'target_lang' => strtoupper( $target ),
+        // Log for debugging (only first 100 chars of each text)
+        if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+            $debug_texts = array_map( function( $text ) {
+                return substr( $text, 0, 100 ) . ( strlen( $text ) > 100 ? '...' : '' );
+            }, $texts_to_send );
+            $this->log( 'DeepL API request: ' . count( $texts_to_send ) . ' texts - ' . implode( ' | ', $debug_texts ) );
+        }
+        
+        // DeepL API requires multiple 'text' parameters for batch translation
+        // We need to build the query string manually
+        $body_parts = [
+            'auth_key=' . urlencode( $this->api_config['api_key'] ),
+            'source_lang=' . urlencode( strtoupper( $source ) ),
+            'target_lang=' . urlencode( strtoupper( $target ) ),
         ];
         
-        if ( ! empty( $this->api_config['formality'] ) ) {
-            $body['formality'] = $this->api_config['formality'];
+        // Add each text as separate parameter
+        foreach ( $texts_to_send as $text ) {
+            $body_parts[] = 'text=' . urlencode( $text );
         }
+        
+        if ( ! empty( $this->api_config['formality'] ) ) {
+            $body_parts[] = 'formality=' . urlencode( $this->api_config['formality'] );
+        }
+        
+        $body = implode( '&', $body_parts );
         
         $attempt = 0;
         
@@ -578,6 +704,9 @@ class Polylang_Auto_Translate_All_Command {
                 $response = wp_remote_post( 'https://api.deepl.com/v2/translate', [
                     'body'    => $body,
                     'timeout' => 30,
+                    'headers' => [
+                        'Content-Type' => 'application/x-www-form-urlencoded',
+                    ],
                 ]);
                 
                 if ( is_wp_error( $response ) ) {
